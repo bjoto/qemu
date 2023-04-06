@@ -156,7 +156,7 @@ static bool virtio_mem_has_shared_zeropage(RAMBlock *rb)
  */
 #if defined(TARGET_X86_64) || defined(TARGET_I386)
 #define VIRTIO_MEM_USABLE_EXTENT (2 * (128 * MiB))
-#elif defined(TARGET_ARM)
+#elif defined(TARGET_ARM) || defined(TARGET_RISCV)
 #define VIRTIO_MEM_USABLE_EXTENT (2 * (512 * MiB))
 #else
 #error VIRTIO_MEM_USABLE_EXTENT not defined

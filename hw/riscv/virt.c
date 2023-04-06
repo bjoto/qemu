@@ -50,7 +50,11 @@
 #include "hw/pci-host/gpex.h"
 #include "hw/display/ramfb.h"
 #include "hw/acpi/aml-build.h"
+#include "hw/mem/memory-device.h"
+#include "hw/virtio/virtio-mem-pci.h"
 #include "qapi/qapi-visit-common.h"
+
+#include <stdint.h>
 
 /*
  * The virt machine physical address space used by some of the devices
@@ -1339,6 +1343,7 @@ static void virt_machine_init(MachineState *machine)
     DeviceState *mmio_irqchip, *virtio_irqchip, *pcie_irqchip;
     int i, base_hartid, hart_count;
     int socket_count = riscv_socket_count(machine);
+    hwaddr device_memory_base, device_memory_size;
 
     /* Check socket count limit */
     if (VIRT_SOCKETS_MAX < socket_count) {
@@ -1473,6 +1478,28 @@ static void virt_machine_init(MachineState *machine)
                            memmap[VIRT_MROM].size, &error_fatal);
     memory_region_add_subregion(system_memory, memmap[VIRT_MROM].base,
                                 mask_rom);
+
+    device_memory_base = ROUND_UP(s->memmap[VIRT_DRAM].base + machine->ram_size,
+                                  GiB);
+    device_memory_size = machine->maxram_size - machine->ram_size;
+
+    if (riscv_is_32bit(&s->soc[0])) {
+        hwaddr memtop = device_memory_base + ROUND_UP(device_memory_size, GiB);
+
+        if (memtop > UINT32_MAX) {
+            error_report("Addressing limited to 32 bits, but memory exceeds"
+                         " it by %lu bytes\n",
+                         memtop - UINT32_MAX);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (device_memory_size > 0) {
+        machine->device_memory = g_malloc0(sizeof(*machine->device_memory));
+        machine->device_memory->base = device_memory_base;
+        memory_region_init(&machine->device_memory->mr, OBJECT(s),
+                           "device-memory", device_memory_size);
+    }
 
     /*
      * Init fw_cfg. Must be done before riscv_load_fdt, otherwise the
@@ -1642,10 +1669,70 @@ static HotplugHandler *virt_machine_get_hotplug_handler(MachineState *machine,
 {
     MachineClass *mc = MACHINE_GET_CLASS(machine);
 
-    if (device_is_dynamic_sysbus(mc, dev)) {
+    if (device_is_dynamic_sysbus(mc, dev) ||
+        object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MEM_PCI)) {
         return HOTPLUG_HANDLER(machine);
     }
     return NULL;
+}
+
+static void virt_virtio_md_pci_pre_plug(HotplugHandler *hotplug_dev,
+                                        DeviceState *dev, Error **errp)
+{
+    HotplugHandler *hotplug_dev2 = qdev_get_bus_hotplug_handler(dev);
+    Error *local_err = NULL;
+
+    if (!hotplug_dev2 && dev->hotplugged) {
+        /*
+         * Without a bus hotplug handler, we cannot control the
+         * plug/unplug order. We should never reach this point when
+         * hotplugging on RISC-V.  However, it's nice to add a safety
+         * net, similar to what we have on x86.
+         */
+        error_setg(errp, "hotplug of virtio based memory devices not supported"
+                   " on this bus.");
+        return;
+    }
+    /*
+     * First, see if we can plug this memory device at all. If that
+     * succeeds, branch of to the actual hotplug handler.
+     */
+    memory_device_pre_plug(MEMORY_DEVICE(dev), MACHINE(hotplug_dev), NULL,
+                           &local_err);
+    if (!local_err && hotplug_dev2) {
+        hotplug_handler_pre_plug(hotplug_dev2, dev, &local_err);
+    }
+    error_propagate(errp, local_err);
+}
+
+static void virt_virtio_md_pci_plug(HotplugHandler *hotplug_dev,
+                                    DeviceState *dev, Error **errp)
+{
+    HotplugHandler *hotplug_dev2 = qdev_get_bus_hotplug_handler(dev);
+    Error *local_err = NULL;
+
+    /*
+     * Plug the memory device first and then branch off to the actual
+     * hotplug handler. If that one fails, we can easily undo the memory
+     * device bits.
+     */
+    memory_device_plug(MEMORY_DEVICE(dev), MACHINE(hotplug_dev));
+    if (hotplug_dev2) {
+        hotplug_handler_plug(hotplug_dev2, dev, &local_err);
+        if (local_err) {
+            memory_device_unplug(MEMORY_DEVICE(dev), MACHINE(hotplug_dev));
+        }
+    }
+    error_propagate(errp, local_err);
+}
+
+
+static void virt_machine_device_pre_plug_cb(HotplugHandler *hotplug_dev,
+                                            DeviceState *dev, Error **errp)
+{
+    if (object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MEM_PCI)) {
+        virt_virtio_md_pci_pre_plug(hotplug_dev, dev, errp);
+    }
 }
 
 static void virt_machine_device_plug_cb(HotplugHandler *hotplug_dev,
@@ -1661,7 +1748,19 @@ static void virt_machine_device_plug_cb(HotplugHandler *hotplug_dev,
                                      SYS_BUS_DEVICE(dev));
         }
     }
+
+    if (object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MEM_PCI)) {
+        virt_virtio_md_pci_plug(hotplug_dev, dev, errp);
+    }
 }
+
+static void virt_machine_device_unplug_request_cb(HotplugHandler *hotplug_dev,
+                                                  DeviceState *dev, Error **errp)
+{
+    error_setg(errp, "device unplug request for unsupported device type: %s",
+               object_get_typename(OBJECT(dev)));
+}
+
 
 static void virt_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -1682,7 +1781,9 @@ static void virt_machine_class_init(ObjectClass *oc, void *data)
     assert(!mc->get_hotplug_handler);
     mc->get_hotplug_handler = virt_machine_get_hotplug_handler;
 
+    hc->pre_plug = virt_machine_device_pre_plug_cb;
     hc->plug = virt_machine_device_plug_cb;
+    hc->unplug_request = virt_machine_device_unplug_request_cb;
 
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_RAMFB_DEVICE);
 #ifdef CONFIG_TPM
